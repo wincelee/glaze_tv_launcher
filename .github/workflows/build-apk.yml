@@ -17,7 +17,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # Pull the launcher source from the original project, so this works from any repo (even an empty one).
       - uses: actions/checkout@v4
+        with:
+          repository: Gathin23/cleanyourtv
+          ref: main
+          path: src
 
       - uses: actions/setup-java@v4
         with:
@@ -29,14 +34,14 @@ jobs:
           packages: "platforms;android-34 build-tools;34.0.0"
 
       - name: Build release APK
-        working-directory: launcher
+        working-directory: src/launcher
         run: |
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           chmod +x gradlew
           ./gradlew assembleRelease --console=plain
 
       - name: Rename APK
-        run: cp launcher/app/build/outputs/apk/release/app-release.apk cleanyourtv-launcher.apk
+        run: cp src/launcher/app/build/outputs/apk/release/app-release.apk cleanyourtv-launcher.apk
 
       - uses: actions/upload-artifact@v4
         with:
