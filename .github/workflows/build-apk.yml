@@ -1,8 +1,10 @@
-name: Build CleanYourTV launcher APK
+name: Build Glaze TV launcher + App List APKs
 
-# Put this file in your fork at: .github/workflows/build-apk.yml
-# Then: Actions tab -> "Build CleanYourTV launcher APK" -> Run workflow.
-# The APK appears under the run's Artifacts and on the repo's Releases page.
+# Put this file in your repo at: .github/workflows/build-apk.yml
+# Then: Actions tab -> "Build Glaze TV launcher + App List APKs" -> Run workflow.
+# Two APKs come out (Artifacts, and the repo's Releases page):
+#   cleanyourtv-launcher.apk  the Apple TV-style home screen (Netflix + Chrome in the dock, working Inputs button)
+#   app-list.apk              lists every installed app with its package name; OK on a row opens its Disable page
 
 on:
   workflow_dispatch:
@@ -33,24 +35,339 @@ jobs:
         with:
           packages: "platforms;android-34 build-tools;34.0.0"
 
-      - name: Build release APK
+      - name: Patch launcher for this TV (Netflix + Chrome dock, HDMI/source panel)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          main = pathlib.Path("src/launcher/app/src/main")
+
+          # ---- config.xml: dock, live TV, source panel ------------------------------------------------
+          cfg = main / "res/values/config.xml"
+          s = cfg.read_text()
+
+          dock = """<string-array name="dock_apps">
+                  <item>com.netflix.ninja</item>
+                  <item>com.netflix.mediaclient</item>
+                  <item>com.google.android.youtube.tv</item>
+                  <item>com.android.chrome</item>
+              </string-array>"""
+          s, n = re.subn(r'<string-array name="dock_apps">.*?</string-array>', lambda m: dock, s, count=1, flags=re.S)
+          assert n == 1, "dock_apps not found"
+
+          # No Live TV package: the Inputs pill then opens the TV's own source panel directly.
+          s, n = re.subn(r'(<string name="live_tv_package" translatable="false">)[^<]*(</string>)',
+                         lambda m: m.group(1) + m.group(2), s, count=1)
+          assert n == 1, "live_tv_package not found"
+
+          old = '<string name="source_panel_service" translatable="false"></string>'
+          assert old in s, "source_panel_service not found"
+          s = s.replace(old, '<string name="source_panel_service" translatable="false">'
+                             'com.cvte.tv.globalui/.InputSourceActivity</string>', 1)
+          old = '<string name="source_panel_action" translatable="false"></string>'
+          assert old in s, "source_panel_action not found"
+          s = s.replace(old, '<string name="source_panel_action" translatable="false">'
+                             'android.intent.action.MAIN</string>', 1)
+          cfg.write_text(s)
+
+          # ---- manifest: let the launcher see the CVTE source panel (Android 11 package visibility) ------
+          man = main / "AndroidManifest.xml"
+          m = man.read_text()
+          anchor = '<package android:name="com.amazon.tv.launcher" />'
+          assert anchor in m, "manifest anchor not found"
+          m = m.replace(anchor, anchor + '\n        <package android:name="com.cvte.tv.globalui" />', 1)
+          man.write_text(m)
+
+          # ---- MainActivity: an HDMI row that cannot open falls back to the source panel -----------------
+          java = main / "java/com/gathin/tvhome/MainActivity.java"
+          j = java.read_text()
+          old = """            if (inputAction.isEmpty()) {
+                          Toast.makeText(this, R.string.not_available, Toast.LENGTH_SHORT).show();
+                          return;
+                      }"""
+          assert j.count(old) == 1, "openInput fallback block not found"
+          j = j.replace(old, """            if (!sourcePanelService.isEmpty()) {
+                          openSourcePanel();
+                          return;
+                      }
+          """ + old, 1)
+          java.write_text(j)
+          print("launcher patched")
+          PY
+
+      - name: Build launcher APK
         working-directory: src/launcher
         run: |
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           chmod +x gradlew
           ./gradlew assembleRelease --console=plain
 
-      - name: Rename APK
-        run: cp src/launcher/app/build/outputs/apk/release/app-release.apk cleanyourtv-launcher.apk
+      - name: Create App List app
+        run: |
+          mkdir -p lister/app/src/main/java/com/glaze/applist
+          cp -r src/launcher/gradle src/launcher/gradlew src/launcher/build.gradle src/launcher/settings.gradle src/launcher/gradle.properties lister/
+          sed -i 's/rootProject.name = "tvhome"/rootProject.name = "applist"/' lister/settings.gradle
+          cat > lister/app/build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.glaze.applist'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.glaze.applist'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      // Sideloaded only: signed with the debug key.
+                      signingConfig signingConfigs.debug
+                  }
+              }
+
+              lint {
+                  checkReleaseBuilds false
+                  abortOnError false
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF_FILE
+          cat > lister/app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+              <!-- Needed to see every installed app on Android 11+. Not distributed through Google Play. -->
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+                  tools:ignore="QueryAllPackagesPermission" />
+
+              <application
+                  android:label="App List"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+                  android:allowBackup="false">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > lister/app/src/main/java/com/glaze/applist/MainActivity.java <<'EOF_FILE'
+          package com.glaze.applist;
+
+          import android.app.Activity;
+          import android.content.ActivityNotFoundException;
+          import android.content.Intent;
+          import android.content.pm.ApplicationInfo;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.graphics.drawable.ColorDrawable;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.ArrayAdapter;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ListView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.List;
+          import java.util.Locale;
+
+          /** Lists every installed app with its package name. OK on a row opens that app's App info page. */
+          public class MainActivity extends Activity {
+              private static final int ALL = 0, USER = 1, SYSTEM = 2;
+
+              private static class Row {
+                  String pkg = "";
+                  String label = "";
+                  boolean system;
+                  boolean disabled;
+                  boolean launchable;
+
+                  String text() {
+                      StringBuilder b = new StringBuilder(pkg);
+                      b.append("   (").append(label).append(")");
+                      b.append(system ? "  [system]" : "  [user]");
+                      if (disabled) b.append("  [DISABLED]");
+                      if (!launchable) b.append("  [no icon]");
+                      return b.toString();
+                  }
+              }
+
+              private final List<Row> all = new ArrayList<>();
+              private final List<Row> shown = new ArrayList<>();
+              private final List<String> lines = new ArrayList<>();
+              private int mode = ALL;
+              private Button filter;
+              private ListView list;
+              private ArrayAdapter<String> adapter;
+
+              @Override
+              protected void onCreate(Bundle state) {
+                  super.onCreate(state);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(Color.BLACK);
+                  root.setPadding(48, 32, 48, 16);
+
+                  filter = new Button(this);
+                  filter.setAllCaps(false);
+                  filter.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          mode = (mode + 1) % 3;
+                          refreshView();
+                      }
+                  });
+
+                  adapter = new ArrayAdapter<String>(this, android.R.layout.simple_list_item_1, lines) {
+                      @Override
+                      public View getView(int position, View convertView, ViewGroup parent) {
+                          TextView t = (TextView) super.getView(position, convertView, parent);
+                          t.setTextColor(Color.WHITE);
+                          t.setTextSize(17);
+                          t.setSingleLine(true);
+                          t.setMinHeight(0);
+                          t.setPadding(24, 10, 24, 10);
+                          return t;
+                      }
+                  };
+
+                  list = new ListView(this);
+                  list.setAdapter(adapter);
+                  list.setSelector(new ColorDrawable(0x55FFFFFF));
+                  list.setDivider(new ColorDrawable(0x22FFFFFF));
+                  list.setDividerHeight(1);
+                  list.setOnItemClickListener(new android.widget.AdapterView.OnItemClickListener() {
+                      @Override
+                      public void onItemClick(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                          if (position < 0 || position >= shown.size()) return;
+                          openAppInfo(shown.get(position).pkg);
+                      }
+                  });
+
+                  root.addView(filter, new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                  root.addView(list, new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+                  setContentView(root);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  int pos = list.getFirstVisiblePosition();
+                  load();
+                  refreshView();
+                  if (pos > 0 && pos < lines.size()) list.setSelection(pos);
+                  list.requestFocus();
+              }
+
+              private void load() {
+                  PackageManager pm = getPackageManager();
+                  all.clear();
+                  List<ApplicationInfo> apps = pm.getInstalledApplications(PackageManager.MATCH_DISABLED_COMPONENTS);
+                  for (ApplicationInfo ai : apps) {
+                      Row r = new Row();
+                      r.pkg = ai.packageName;
+                      CharSequence l = pm.getApplicationLabel(ai);
+                      r.label = l == null ? "" : l.toString();
+                      r.system = (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
+                      r.disabled = !ai.enabled;
+                      r.launchable = pm.getLaunchIntentForPackage(ai.packageName) != null
+                              || pm.getLeanbackLaunchIntentForPackage(ai.packageName) != null;
+                      all.add(r);
+                  }
+                  // Apps with an icon first (the ones you recognise), then background services, each by package name.
+                  Collections.sort(all, new java.util.Comparator<Row>() {
+                      @Override
+                      public int compare(Row a, Row b) {
+                          if (a.launchable != b.launchable) return a.launchable ? -1 : 1;
+                          return a.pkg.compareToIgnoreCase(b.pkg);
+                      }
+                  });
+              }
+
+              private void refreshView() {
+                  shown.clear();
+                  lines.clear();
+                  for (Row r : all) {
+                      if (mode == USER && r.system) continue;
+                      if (mode == SYSTEM && !r.system) continue;
+                      shown.add(r);
+                      lines.add(r.text());
+                  }
+                  String name = mode == ALL ? "ALL apps" : mode == USER ? "USER-installed apps" : "SYSTEM apps";
+                  filter.setText(String.format(Locale.US,
+                          "Showing %s: %d   |   press OK here to change filter   |   OK on a row opens its App info (Disable)",
+                          name, shown.size()));
+                  adapter.notifyDataSetChanged();
+              }
+
+              private void openAppInfo(String pkg) {
+                  Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + pkg));
+                  try {
+                      startActivity(i);
+                  } catch (ActivityNotFoundException | SecurityException e) {
+                      Toast.makeText(this, "This TV has no App info page for " + pkg, Toast.LENGTH_LONG).show();
+                  }
+              }
+          }
+          EOF_FILE
+
+      - name: Build App List APK
+        working-directory: lister
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x gradlew
+          ./gradlew assembleRelease --console=plain
+
+      - name: Collect APKs
+        run: |
+          cp src/launcher/app/build/outputs/apk/release/app-release.apk cleanyourtv-launcher.apk
+          cp lister/app/build/outputs/apk/release/app-release.apk app-list.apk
+          ls -l *.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cleanyourtv-launcher
-          path: cleanyourtv-launcher.apk
+          name: glaze-tv-apks
+          path: |
+            cleanyourtv-launcher.apk
+            app-list.apk
 
       - name: Publish to a release (easy to download on the TV)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: apk-${{ github.run_number }}
-          name: Launcher APK build ${{ github.run_number }}
-          files: cleanyourtv-launcher.apk
+          name: Glaze TV APKs build ${{ github.run_number }}
+          files: |
+            cleanyourtv-launcher.apk
+            app-list.apk
